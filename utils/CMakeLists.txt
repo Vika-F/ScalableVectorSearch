@@ -49,6 +49,7 @@ create_utility(convert_data_to_float16 convert_data_to_float16.cpp)
 create_utility(convert_data_to_bfloat16 convert_data_to_bfloat16.cpp)
 create_utility(search_index search_index.cpp)
 create_utility(consolidate characterization/consolidate.cpp)
+create_utility(heuristic_prune characterization/heuristic_prune.cpp)
 create_utility(logging logging.cpp)
 
 # IVF build and search
