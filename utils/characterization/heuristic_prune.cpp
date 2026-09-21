@@ -50,6 +50,8 @@
 #include "svs/core/logging.h"
 #include "svs/index/vamana/index.h"
 #include "svs/index/vamana/prune.h"
+#include "svs/lib/datatype.h"
+#include "svs/lib/float16.h"
 #include "svs/lib/timing.h"
 #include "svs/third-party/fmt.h"
 
@@ -63,7 +65,7 @@
 
 namespace {
 
-using Eltype = float;
+using fptype = svs::Float16;
 
 struct Options {
     // Dataset.
@@ -183,8 +185,8 @@ Options parse_options(const std::vector<std::string>& args) {
 // Clustered synthetic data. Uniformly random vectors make every candidate roughly
 // equidistant, which is not representative of the pruning workload; clusters give the
 // greedy search something to converge on and therefore realistic candidate pools.
-svs::data::SimpleData<Eltype> generate_dataset(const Options& options) {
-    auto data = svs::data::SimpleData<Eltype>(options.num_vectors, options.dims);
+svs::data::SimpleData<fptype> generate_dataset(const Options& options) {
+    auto data = svs::data::SimpleData<fptype>(options.num_vectors, options.dims);
     auto rng = std::mt19937_64(options.seed);
     auto normal = std::normal_distribution<float>(0.0F, 1.0F);
 
@@ -237,15 +239,16 @@ template <typename Distance> int run(const Options& options, Distance distance) 
             return generate_dataset(options);
         }
         fmt::print("Loading vectors from {}\n", options.data_path);
-        return svs::load_data<Eltype>(options.data_path);
+        return svs::load_data<fptype>(options.data_path);
     }();
 
     fmt::print(
-        "Dataset: {} vectors, {} dimensions\n"
+        "Dataset: {} vectors, {} dimensions, {} elements\n"
         "Distance: {} -> IterativePruneStrategy\n"
         "Building with {} threads...\n",
         data.size(),
         data.dimensions(),
+        svs::name(svs::datatype_v<fptype>),
         options.distance,
         num_threads
     );
