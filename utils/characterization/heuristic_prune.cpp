@@ -70,7 +70,24 @@ using fptype = svs::Float16;
 struct Options {
     // Dataset.
     std::string data_path{};
-    size_t num_vectors = 100'000;
+    // Sized so the vector data alone overflows the last-level cache, which is what makes
+    // the prune call sites take real cache misses on their candidate gathers instead of
+    // replaying out of L3.
+    //
+    // `SimpleData` allocates exactly `num_vectors * dims * sizeof(fptype)` (no row
+    // padding), so with the defaults below: 2e6 * 128 * 2 B = 512 MB = 488 MiB. The graph
+    // (`graph_max_degree` 32-bit ids per vertex) adds another ~512 MB on top.
+    //
+    // Check the target machine before trusting that default -- the relevant number is the
+    // L3 size *and* its sharing domain:
+    //
+    //     cat /sys/devices/system/cpu/cpu0/cache/index3/{size,shared_cpu_list}
+    //
+    // On the 2-socket machine this reproducer was written against, that is 300 MiB shared
+    // by one whole socket (with sub-NUMA clustering on, a socket spans two NUMA nodes, so
+    // the cores of a single node still address the full 300 MiB). 488 MiB clears it by
+    // ~1.6x; scale `--num-vectors` up if your L3 is larger.
+    size_t num_vectors = 2'000'000;
     size_t dims = 128;
     size_t num_clusters = 200;
     uint64_t seed = 0xC0FFEE;
@@ -95,7 +112,8 @@ Builds a Vamana index whose distance functor selects IterativePruneStrategy.
 
 Dataset:
   --data <path>                  Load vectors from a file instead of generating them.
-  --num-vectors <n>              Synthetic dataset size. Default: 100000.
+  --num-vectors <n>              Synthetic dataset size. Default: 2000000, chosen so the
+                                 vector data exceeds the last-level cache.
   --dims <n>                     Synthetic dimensionality. Default: 128.
   --num-clusters <n>             Synthetic cluster count. Default: 200.
   --seed <n>                     RNG seed. Default: 12648430.
@@ -242,13 +260,22 @@ template <typename Distance> int run(const Options& options, Distance distance) 
         return svs::load_data<fptype>(options.data_path);
     }();
 
+    // Exact for `SimpleData`, which allocates a single unpadded `size x dimensions` array.
+    constexpr double mib = 1024.0 * 1024.0;
+    const size_t data_bytes = data.size() * data.dimensions() * sizeof(fptype);
+    const size_t graph_bytes = data.size() * options.graph_max_degree * sizeof(uint32_t);
+
     fmt::print(
         "Dataset: {} vectors, {} dimensions, {} elements\n"
+        "Footprint: {:.1f} MiB of vectors (+ ~{:.1f} MiB of graph) -- compare against\n"
+        "           /sys/devices/system/cpu/cpu0/cache/index3/size, the L3 it must miss\n"
         "Distance: {} -> IterativePruneStrategy\n"
         "Building with {} threads...\n",
         data.size(),
         data.dimensions(),
         svs::name(svs::datatype_v<fptype>),
+        static_cast<double>(data_bytes) / mib,
+        static_cast<double>(graph_bytes) / mib,
         options.distance,
         num_threads
     );
