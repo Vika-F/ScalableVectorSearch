@@ -184,8 +184,11 @@ struct MemoryBreakdown {
     size_t graph_bytes = 0;
     size_t data_bytes = 0;
     size_t metadata_bytes = 0;
+    size_t reverse_edges_bytes = 0;
 
-    size_t total() const { return graph_bytes + data_bytes + metadata_bytes; }
+    size_t total() const {
+        return graph_bytes + data_bytes + metadata_bytes + reverse_edges_bytes;
+    }
 };
 
 ///
@@ -454,6 +457,12 @@ class VamanaIndex {
         set_search_parameters(parameters.search_parameters);
     }
 
+    /// @brief Return the current configuration parameters for the index.
+    VamanaIndexParameters parameters() const {
+        return VamanaIndexParameters{
+            entry_point_.front(), build_parameters_, get_search_parameters()};
+    }
+
     /// @brief Return scratch space resources for external threading.
     scratchspace_type scratchspace(const VamanaSearchParameters& sp) const {
         return scratchspace_type{
@@ -580,19 +589,17 @@ class VamanaIndex {
 
                 // Allocate scratchspace according to the provided search parameters.
                 auto search_buffer = search_buffer_type{
-                    SearchBufferConfig(search_parameters.buffer_config_),
+                    // Increase the search window size if the defaults are not suitable for
+                    // the requested number of neighbors.
+                    search_parameters.buffer_config_.get_total_capacity() < num_neighbors
+                        ? SearchBufferConfig{num_neighbors}
+                        : search_parameters.buffer_config_,
                     distance::comparator(distance_),
                     search_parameters.search_buffer_visited_set_};
 
                 auto prefetch_parameters = GreedySearchPrefetchParameters{
                     search_parameters.prefetch_lookahead_,
                     search_parameters.prefetch_step_};
-
-                // Increase the search window size if the defaults are not suitable for the
-                // requested number of neighbors.
-                if (search_buffer.capacity() < num_neighbors) {
-                    search_buffer.change_maxsize(SearchBufferConfig{num_neighbors});
-                }
 
                 // Pre-allocate scratch space needed by the dataset implementation.
                 auto scratch = extensions::per_thread_batch_search_setup(data_, distance_);
@@ -762,9 +769,10 @@ class VamanaIndex {
     /// over-allocation is reflected. Metadata includes entry points. Integrators can use
     /// this to report the true memory footprint of the index.
     MemoryBreakdown get_memory_breakdown() const {
+        using namespace svs::data;
         MemoryBreakdown usage{};
-        usage.graph_bytes = svs::data::detail::dataset_allocated_bytes(graph_.get_data());
-        usage.data_bytes = svs::data::detail::dataset_allocated_bytes(data_);
+        usage.graph_bytes = dataset_allocated_bytes(graph_.get_data());
+        usage.data_bytes = dataset_allocated_bytes(data_);
         usage.metadata_bytes =
             entry_point_.capacity() * sizeof(typename entry_point_type::value_type);
         return usage;
@@ -831,11 +839,10 @@ class VamanaIndex {
         const std::filesystem::path& data_directory
     ) const {
         // Construct and save runtime parameters.
-        auto parameters = VamanaIndexParameters{
-            entry_point_.front(), build_parameters_, get_search_parameters()};
+        auto config = parameters();
 
         // Config
-        lib::save_to_disk(parameters, config_directory);
+        lib::save_to_disk(config, config_directory);
         // Data
         lib::save_to_disk(data_, data_directory);
         // Graph
@@ -844,12 +851,11 @@ class VamanaIndex {
 
     void save(std::ostream& os) const {
         // Construct and save runtime parameters.
-        auto parameters = VamanaIndexParameters{
-            entry_point_.front(), build_parameters_, get_search_parameters()};
+        auto config = parameters();
 
         lib::begin_serialization(os);
         // Config
-        lib::save_to_stream(parameters, os);
+        lib::save_to_stream(config, os);
         // Data
         lib::save_to_stream(data_, os);
         // // Graph
@@ -942,6 +948,9 @@ class VamanaIndex {
     ) const {
         return BatchIterator(*this, query, extra_search_buffer_capacity);
     }
+
+    const Data& view_data() const { return data_; }
+    const Graph& view_graph() const { return graph_; }
 };
 
 // Shared documentation for assembly methods.
@@ -996,10 +1005,24 @@ auto auto_build(
         logger};
 }
 
+namespace detail {
+template <typename ConfigProto>
+VamanaIndexParameters auto_load_config(ConfigProto&& config_proto) {
+    if constexpr (std::is_convertible_v<ConfigProto, std::filesystem::path>) {
+        return lib::load_from_disk<VamanaIndexParameters>(
+            std::filesystem::path(std::forward<ConfigProto>(config_proto))
+        );
+    } else {
+        return svs::detail::dispatch_load(std::forward<ConfigProto>(config_proto));
+    }
+}
+} // namespace detail
+
 ///
 /// @brief Entry point for loading a Vamana graph-index from disk.
 ///
-/// @param config_path The directory where the index configuration file resides.
+/// @param config_proto The configuration proto or the directory where the index
+/// configuration file resides.
 /// @param graph_loader A ``svs::GraphLoader`` for loading the graph.
 /// @param data_proto A dispatch loadable class yielding a dataset.
 /// @param distance The distance **functor** to use to compare queries with elements of
@@ -1018,12 +1041,13 @@ auto auto_build(
 /// @copydoc threadpool_requirements
 ///
 template <
+    typename ConfigProto,
     typename GraphProto,
     typename DataProto,
     typename Distance,
     typename ThreadPoolProto>
 auto auto_assemble(
-    const std::filesystem::path& config_path,
+    ConfigProto&& config_proto,
     GraphProto graph_loader,
     DataProto data_proto,
     Distance distance,
@@ -1031,6 +1055,7 @@ auto auto_assemble(
     svs::logging::logger_ptr logger = svs::logging::get()
 ) {
     auto threadpool = threads::as_threadpool(std::move(threadpool_proto));
+    auto config = detail::auto_load_config(std::forward<ConfigProto>(config_proto));
     auto data = svs::detail::dispatch_load(std::move(data_proto), threadpool);
     auto graph = svs::detail::dispatch_load(std::move(graph_loader), threadpool);
 
@@ -1043,7 +1068,6 @@ auto auto_assemble(
         std::move(distance),
         std::move(threadpool),
         std::move(logger)};
-    auto config = lib::load_from_disk<VamanaIndexParameters>(config_path);
     index.apply(config);
     return index;
 }

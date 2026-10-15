@@ -53,6 +53,9 @@ class DynamicVamanaInterface : public VamanaInterface {
 
     // Non-templated virtual method for distance calculation
     virtual double get_distance(size_t id, const AnonymousArray<1>& query) const = 0;
+
+    // Check if the index has been consolidated - no `Deleted` entries remain.
+    virtual bool is_consolidated() const = 0;
 };
 
 template <lib::TypeList QueryTypes, typename Impl>
@@ -103,6 +106,9 @@ class DynamicVamanaImpl : public VamanaImpl<QueryTypes, Impl, DynamicVamanaInter
             }
         );
     }
+
+    // Check if the index has been consolidated - no `Deleted` entries remain.
+    bool is_consolidated() const override { return impl().is_consolidated(); }
 };
 
 // Forward Declaractions.
@@ -119,6 +125,9 @@ class DynamicVamana : public manager::IndexManager<DynamicVamanaInterface> {
     using base_type = manager::IndexManager<DynamicVamanaInterface>;
     using VamanaSearchParameters = index::vamana::VamanaSearchParameters;
 
+    /// @private
+    struct BuildTag {};
+    /// @private
     struct AssembleTag {};
 
     ///
@@ -276,6 +285,7 @@ class DynamicVamana : public manager::IndexManager<DynamicVamanaInterface> {
     /// @tparam DataLoader   A data loader or dataset type.
     /// @tparam Distance     Distance functor or ``svs::DistanceType`` enum.
     /// @tparam ThreadPoolProto  Thread pool type or size_t).
+    /// @tparam GraphAllocator The type of allocator used for the graph.
     ///
     /// @param parameters Build parameters controlling graph construction.
     /// @param data_loader Loader (or dataset) from which to obtain the data.
@@ -283,18 +293,24 @@ class DynamicVamana : public manager::IndexManager<DynamicVamanaInterface> {
     /// ``data.size()``.
     /// @param distance Distance functor or enum.
     /// @param threadpool_proto Thread pool or number of threads to use.
+    /// @param graph_allocator Allocator instance to use for the graph.
+    /// @param logger The logger to use for this index. Defaults to the global SVS logger
+    ///     (``svs::logging::get()``).
     ///
     template <
         manager::QueryTypeDefinition QueryTypes,
         typename DataLoader,
         typename Distance,
-        typename ThreadPoolProto>
+        typename ThreadPoolProto,
+        typename GraphAllocator = data::Blocked<HugepageAllocator<uint32_t>>>
     static DynamicVamana build(
         const index::vamana::VamanaBuildParameters& parameters,
         DataLoader&& data_loader,
         std::span<const size_t> ids,
         Distance distance,
-        ThreadPoolProto threadpool_proto
+        ThreadPoolProto threadpool_proto,
+        const GraphAllocator& graph_allocator = {},
+        svs::logging::logger_ptr logger = svs::logging::get()
     ) {
         auto threadpool = threads::as_threadpool(std::move(threadpool_proto));
         auto data =
@@ -304,66 +320,112 @@ class DynamicVamana : public manager::IndexManager<DynamicVamanaInterface> {
             auto dispatcher = DistanceDispatcher(distance);
             return dispatcher([&](auto distance_function) {
                 return make_dynamic_vamana<manager::as_typelist<QueryTypes>>(
+                    BuildTag{},
                     parameters,
                     std::move(data),
                     ids,
                     std::move(distance_function),
-                    std::move(threadpool)
+                    std::move(threadpool),
+                    graph_allocator,
+                    std::move(logger)
                 );
             });
         } else {
             return make_dynamic_vamana<manager::as_typelist<QueryTypes>>(
-                parameters, std::move(data), ids, std::move(distance), std::move(threadpool)
+                BuildTag{},
+                parameters,
+                std::move(data),
+                ids,
+                std::move(distance),
+                std::move(threadpool),
+                graph_allocator,
+                std::move(logger)
             );
         }
     }
 
     // Assembly
+    ///
+    /// @brief Load a DynamicVamana index from a previously saved index.
+    ///
+    /// @param config_path Path to the directory where the index configuration was saved.
+    /// @param graph_loader The loader for the graph to use.
+    /// @param data_loader An acceptable data loader or dataset.
+    /// @param distance Distance functor or ``svs::DistanceType`` enum.
+    /// @param threadpool_proto Thread pool or number of threads to use.
+    /// @param debug_load_from_static Internal/unstable: load files produced by the static
+    ///     index using an identity ID translation.
+    /// @param logger The logger to use for this index. Defaults to the global SVS logger
+    ///     (``svs::logging::get()``).
+    ///
     template <
         manager::QueryTypeDefinition QueryTypes,
+        typename ConfigProto,
         typename GraphLoader,
         typename DataLoader,
         typename Distance,
         typename ThreadPoolProto>
     static DynamicVamana assemble(
-        const std::filesystem::path& config_path,
+        ConfigProto&& config_proto,
         GraphLoader&& graph_loader,
         DataLoader&& data_loader,
         const Distance& distance,
         ThreadPoolProto threadpool_proto,
-        bool debug_load_from_static = false
+        bool debug_load_from_static = false,
+        svs::logging::logger_ptr logger = svs::logging::get()
     ) {
         return DynamicVamana(
             AssembleTag(),
             manager::as_typelist<QueryTypes>(),
             index::vamana::auto_dynamic_assemble(
-                config_path,
+                std::forward<ConfigProto>(config_proto),
                 std::forward<GraphLoader>(graph_loader),
                 std::forward<DataLoader>(data_loader),
                 distance,
                 threads::as_threadpool(std::move(threadpool_proto)),
-                debug_load_from_static
+                debug_load_from_static,
+                std::move(logger)
             )
         );
     }
 
     // Assembly from stream
+    ///
+    /// @brief Assemble a DynamicVamana index from a serialized stream.
+    ///
+    /// @tparam QueryTypes   The set of query element types supported by the resulting
+    /// index.
+    /// @tparam Data         The dataset type to load.
+    /// @tparam Distance     Distance functor or ``svs::DistanceType`` enum.
+    /// @tparam ThreadPoolProto  Thread pool type or size_t.
+    /// @tparam DataAllocator  The type of allocator used for the dataset.
+    /// @tparam GraphAllocator The type of allocator used for the graph. Defaults to an
+    /// exact-size ``HugepageAllocator<uint32_t>``; a blocked default commits a full block.
+    ///
+    /// @param stream Stream containing the serialized index.
+    /// @param distance Distance functor or enum.
+    /// @param threadpool_proto Thread pool or number of threads to use.
+    /// @param data_allocator Allocator instance to use for the dataset.
+    /// @param graph_allocator Allocator instance to use for the graph.
+    ///
     template <
         manager::QueryTypeDefinition QueryTypes,
         typename Data,
         typename Distance,
         typename ThreadPoolProto,
-        typename... DataLoaderArgs>
+        typename DataAllocator = typename Data::allocator_type,
+        typename GraphAllocator = HugepageAllocator<uint32_t>>
     static DynamicVamana assemble(
         std::istream& stream,
         const Distance& distance,
         ThreadPoolProto threadpool_proto,
-        DataLoaderArgs&&... data_args
+        const DataAllocator& data_allocator = {},
+        const GraphAllocator& graph_allocator = {}
     ) {
         auto deserializer = svs::lib::detail::Deserializer::build(stream);
         if (deserializer.is_native()) {
             auto threadpool = threads::as_threadpool(std::move(threadpool_proto));
-            using GraphType = svs::GraphLoader<>::return_type;
+            using GraphType = graphs::SimpleGraph<uint32_t, GraphAllocator>;
             if constexpr (std::is_same_v<std::decay_t<Distance>, DistanceType>) {
                 auto dispatcher = DistanceDispatcher(distance);
                 return dispatcher([&](auto distance_function) {
@@ -371,12 +433,12 @@ class DynamicVamana : public manager::IndexManager<DynamicVamanaInterface> {
                         index::vamana::auto_dynamic_assemble(
                             stream,
                             // lazy graph loader
-                            [&]() -> GraphType { return GraphType::load(stream); },
+                            [&]() -> GraphType {
+                                return GraphType::load(stream, graph_allocator);
+                            },
                             // lazy data loader
                             [&]() -> Data {
-                                return lib::load_from_stream<Data>(
-                                    stream, SVS_FWD(data_args)...
-                                );
+                                return lib::load_from_stream<Data>(stream, data_allocator);
                             },
                             distance_function,
                             std::move(threadpool)
@@ -388,12 +450,12 @@ class DynamicVamana : public manager::IndexManager<DynamicVamanaInterface> {
                     index::vamana::auto_dynamic_assemble(
                         stream,
                         // lazy graph loader
-                        [&]() -> GraphType { return GraphType::load(stream); },
+                        [&]() -> GraphType {
+                            return GraphType::load(stream, graph_allocator);
+                        },
                         // lazy data loader
                         [&]() -> Data {
-                            return lib::load_from_stream<Data>(
-                                stream, SVS_FWD(data_args)...
-                            );
+                            return lib::load_from_stream<Data>(stream, data_allocator);
                         },
                         distance,
                         std::move(threadpool)
@@ -424,8 +486,8 @@ class DynamicVamana : public manager::IndexManager<DynamicVamanaInterface> {
 
             return assemble<QueryTypes>(
                 config_path,
-                svs::GraphLoader{graph_path},
-                lib::load_from_disk<Data>(data_path, SVS_FWD(data_args)...),
+                svs::GraphLoader{graph_path, graph_allocator},
+                lib::load_from_disk<Data>(data_path, data_allocator),
                 distance,
                 threads::as_threadpool(std::move(threadpool_proto)),
                 false
@@ -495,6 +557,13 @@ class DynamicVamana : public manager::IndexManager<DynamicVamanaInterface> {
         AnonymousArray<1> query_array{query.data(), query.size()};
         return impl_->get_distance(id, query_array);
     }
+
+    svs::index::vamana::VamanaIndexParameters parameters() const {
+        return impl_->parameters();
+    }
+
+    /// @brief Check if the index has been consolidated - no `Deleted` entries remain.
+    bool is_consolidated() const { return impl_->is_consolidated(); }
 };
 
 ///
@@ -506,6 +575,13 @@ DynamicVamana make_dynamic_vamana(Args&&... args) {
     using Impl = decltype(index::vamana::MutableVamanaIndex{std::forward<Args>(args)...});
     return DynamicVamana{
         std::make_unique<DynamicVamanaImpl<QueryTypes, Impl>>(std::forward<Args>(args)...)};
+}
+
+template <lib::TypeList QueryTypes, typename... Args>
+DynamicVamana make_dynamic_vamana(DynamicVamana::BuildTag SVS_UNUSED(tag), Args&&... args) {
+    return make_dynamic_vamana<QueryTypes>(
+        index::vamana::auto_dynamic_build(std::forward<Args>(args)...)
+    );
 }
 
 } // namespace svs

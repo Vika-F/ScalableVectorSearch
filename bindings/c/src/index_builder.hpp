@@ -18,139 +18,154 @@
 #include "svs/c/svs_c.h"
 
 #include "algorithm.hpp"
-#include "dispatcher_dynamic_vamana.hpp"
-#include "dispatcher_vamana.hpp"
-#include "index.hpp"
+#include "allocator.hpp"
+#include "data_builder.hpp"
 #include "storage.hpp"
 #include "threadpool.hpp"
 #include "types_support.hpp"
 
 #include <svs/concepts/data.h>
-#include <svs/core/distance.h>
-#include <svs/core/query_result.h>
-#include <svs/index/vamana/build_params.h>
-#include <svs/lib/float16.h>
-#include <svs/orchestrators/vamana.h>
+#include <svs/core/data/simple.h>
+#include <svs/core/logging.h>
+#include <svs/index/vamana/index.h>
 
 #include <filesystem>
+#include <istream>
 #include <memory>
+#include <span>
+#include <utility>
 
 namespace svs::c_runtime {
+
+struct Index;
+struct DynamicIndex;
 
 struct IndexBuilder {
     svs_distance_metric_t distance_metric;
     size_t dimension;
-    std::shared_ptr<Algorithm> algorithm;
-    std::shared_ptr<Storage> storage;
+    std::unique_ptr<Algorithm> algorithm;
+    std::unique_ptr<Storage> storage;
     ThreadPoolBuilder pool_builder;
+    AllocatorBuilder allocator_builder;
+    // Logger for indexes built or loaded by this builder. Empty means: use the SVS global
+    // default logger current at build/load time.
+    svs::logging::logger_ptr logger;
 
     IndexBuilder(
         svs_distance_metric_t distance_metric,
         size_t dimension,
-        std::shared_ptr<Algorithm> algorithm
+        const std::shared_ptr<Algorithm>& algorithm
     )
         : distance_metric(distance_metric)
         , dimension(dimension)
-        , algorithm(std::move(algorithm))
-        , storage(std::make_shared<StorageSimple>(SVS_DATA_TYPE_FLOAT32))
-        , pool_builder{} {}
+        , algorithm(algorithm->clone())
+        , storage(std::make_unique<StorageSimple>(SVS_DATA_TYPE_FLOAT32))
+        , pool_builder{}
+        , allocator_builder{} {}
 
-    ~IndexBuilder() {}
+    IndexBuilder(const IndexBuilder& other)
+        : distance_metric(other.distance_metric)
+        , dimension(other.dimension)
+        , algorithm(other.algorithm->clone())
+        , storage(other.storage->clone())
+        , pool_builder(other.pool_builder)
+        , allocator_builder(other.allocator_builder)
+        , logger(other.logger) {}
 
-    void set_storage(std::shared_ptr<Storage> storage) {
-        this->storage = std::move(storage);
+    IndexBuilder& operator=(const IndexBuilder& other) {
+        if (this != &other) {
+            distance_metric = other.distance_metric;
+            dimension = other.dimension;
+            algorithm = other.algorithm->clone();
+            storage = other.storage->clone();
+            pool_builder = other.pool_builder;
+            allocator_builder = other.allocator_builder;
+            logger = other.logger;
+        }
+        return *this;
+    }
+
+    IndexBuilder(IndexBuilder&&) = default;
+    IndexBuilder& operator=(IndexBuilder&&) = default;
+    ~IndexBuilder() = default;
+
+    void set_storage(const std::shared_ptr<Storage>& storage) {
+        this->storage = storage->clone();
     }
 
     void set_threadpool_builder(ThreadPoolBuilder threadpool_builder) {
         std::swap(this->pool_builder, threadpool_builder);
     }
 
-    std::shared_ptr<Index> build(const svs::data::ConstSimpleDataView<float>& data) {
-        if (algorithm->type == SVS_ALGORITHM_TYPE_VAMANA) {
-            auto vamana_algorithm = std::static_pointer_cast<AlgorithmVamana>(algorithm);
-
-            auto index = std::make_shared<IndexVamana>(
-                dispatch_vamana_index_build(
-                    vamana_algorithm->build_parameters(),
-                    data,
-                    storage.get(),
-                    to_distance_type(distance_metric),
-                    pool_builder.build()
-                ),
-                pool_builder
-            );
-
-            return index;
-        }
-        return nullptr;
+    void set_allocator_builder(AllocatorBuilder allocator_builder) {
+        std::swap(this->allocator_builder, allocator_builder);
     }
 
-    std::shared_ptr<Index> load(const std::filesystem::path& directory) {
-        if (algorithm->type == SVS_ALGORITHM_TYPE_VAMANA) {
-            auto vamana_algorithm = std::static_pointer_cast<AlgorithmVamana>(algorithm);
+    void set_logger(svs::logging::logger_ptr logger) { this->logger = std::move(logger); }
 
-            auto index = std::make_shared<IndexVamana>(
-                dispatch_vamana_index_load(
-                    vamana_algorithm->build_parameters(),
-                    directory,
-                    storage.get(),
-                    to_distance_type(distance_metric),
-                    pool_builder.build()
-                ),
-                pool_builder
-            );
-
-            return index;
-        }
-        return nullptr;
+    // The logger to pass to SVS: the builder's logger if set, else the current global.
+    svs::logging::logger_ptr get_logger() const {
+        return logger ? logger : svs::logging::get();
     }
+
+    std::shared_ptr<Index> build(const svs::data::ConstSimpleDataView<float>& data);
+
+    std::shared_ptr<Index> load(const std::filesystem::path& directory);
+
+    std::shared_ptr<Index> load_stream(std::unique_ptr<std::istream>&& stream);
+
+    std::shared_ptr<Index> copy(const std::shared_ptr<Index>& src_index);
 
     std::shared_ptr<DynamicIndex> build_dynamic(
         const svs::data::ConstSimpleDataView<float>& data,
         std::span<const size_t> ids,
-        size_t blocksize_bytes
-    ) {
-        if (algorithm->type == SVS_ALGORITHM_TYPE_VAMANA) {
-            auto vamana_algorithm = std::static_pointer_cast<AlgorithmVamana>(algorithm);
+        const svs::data::BlockingParameters& block_params,
+        svs_sync_kind_t sync_kind = SVS_SYNC_KIND_NONE
+    );
 
-            auto index = std::make_shared<DynamicIndexVamana>(
-                dispatch_dynamic_vamana_index_build(
-                    vamana_algorithm->build_parameters(),
-                    data,
-                    ids,
-                    storage.get(),
-                    to_distance_type(distance_metric),
-                    pool_builder.build(),
-                    blocksize_bytes
-                ),
-                pool_builder
-            );
+    std::shared_ptr<DynamicIndex> load_dynamic(
+        const std::filesystem::path& directory,
+        const svs::data::BlockingParameters& block_params,
+        svs_sync_kind_t sync_kind = SVS_SYNC_KIND_NONE
+    );
 
-            return index;
-        }
-        return nullptr;
-    }
+    std::shared_ptr<DynamicIndex> load_stream_dynamic(
+        std::unique_ptr<std::istream>&& stream,
+        const svs::data::BlockingParameters& block_params,
+        svs_sync_kind_t sync_kind = SVS_SYNC_KIND_NONE
+    );
 
-    std::shared_ptr<DynamicIndex>
-    load_dynamic(const std::filesystem::path& directory, size_t blocksize_bytes) {
-        if (algorithm->type == SVS_ALGORITHM_TYPE_VAMANA) {
-            auto vamana_algorithm = std::static_pointer_cast<AlgorithmVamana>(algorithm);
+    std::shared_ptr<DynamicIndex> copy_dynamic(
+        const std::shared_ptr<Index>& src_index,
+        const svs::data::BlockingParameters& block_params,
+        svs_sync_kind_t sync_kind = SVS_SYNC_KIND_NONE
+    );
 
-            auto index = std::make_shared<DynamicIndexVamana>(
-                dispatch_dynamic_vamana_index_load(
-                    vamana_algorithm->build_parameters(),
-                    directory,
-                    storage.get(),
-                    to_distance_type(distance_metric),
-                    pool_builder.build(),
-                    blocksize_bytes
-                ),
-                pool_builder
-            );
+    // Estimate the memory a built static Vamana index would consume
+    // for `num_vectors` vectors. Mirrors the accounting done by
+    // svs::index::vamana::VamanaIndex::get_memory_breakdown().
+    svs::index::vamana::MemoryBreakdown estimate_memory_breakdown(size_t num_vectors) const;
 
-            return index;
-        }
-        return nullptr;
-    }
+    // Estimate the memory a built dynamic Vamana index would consume
+    // for `num_vectors` vectors. Mirrors the accounting done by
+    // svs::index::vamana::MutableVamanaIndex::get_memory_breakdown().
+    svs::index::vamana::MemoryBreakdown estimate_memory_breakdown_dynamic(
+        size_t num_vectors, const svs::data::BlockingParameters& block_params
+    ) const;
+
+    size_t estimate_search_memory(
+        size_t num_queries,
+        size_t num_neighbors,
+        const std::shared_ptr<Algorithm::SearchParams>& search_params,
+        const IDFilterInterface* id_filter
+    ) const;
+
+    size_t estimate_search_memory_dynamic(
+        size_t num_queries,
+        size_t num_neighbors,
+        const std::shared_ptr<Algorithm::SearchParams>& search_params,
+        const IDFilterInterface* id_filter,
+        const svs::data::BlockingParameters& block_params
+    ) const;
 };
 } // namespace svs::c_runtime

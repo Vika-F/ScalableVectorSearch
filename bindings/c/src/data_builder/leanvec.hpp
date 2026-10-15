@@ -19,6 +19,7 @@
 
 #include "svs/c/svs_c.h"
 
+#include "data_builder/lvq.hpp"
 #include "leanvec_training_data.hpp"
 #include "storage.hpp"
 #include "types_support.hpp"
@@ -40,6 +41,7 @@
 #include <svs/extensions/vamana/leanvec.h>
 #endif // SVS_LEANVEC_HEADER
 
+#include <cstddef>
 #include <filesystem>
 #include <optional>
 #include <stdexcept>
@@ -70,9 +72,9 @@ class LeanVecDataBuilder {
         Allocator>;
     using allocator_type = Allocator;
 
-    template <Arithmetic T>
+    template <svs::data::ImmutableMemoryDataset Dataset>
     data_type build(
-        svs::data::ConstSimpleDataView<T> view,
+        const Dataset& view,
         svs::threads::ThreadPoolHandle& pool,
         const allocator_type& allocator = {}
     ) {
@@ -84,6 +86,61 @@ class LeanVecDataBuilder {
     data_type
     load(const std::filesystem::path& path, const allocator_type& allocator = {}) {
         return svs::lib::load_from_disk<data_type>(path, allocator);
+    }
+
+    size_t estimate_size(
+        size_t num_vectors, size_t dimension, const allocator_type& allocator = {}
+    ) const {
+        // Current version of LeanVecDataBuilder supports LVQ-only datasets, so we can
+        // directly reuse LVQDataBuilder::estimate_size()
+        //
+        // LeanDataset uses primary-only LVQ (ResidualBits == 0), so we can use
+        // LVQDataBuilder<I1, 0> and LVQDataBuilder<I2, 0> to estimate sizes for primary and
+        // secondary datasets.
+
+        // Estimate primary size
+        using primary_data_builder = LVQDataBuilder<I1, 0, allocator_type>;
+        const auto primary_size =
+            primary_data_builder{}.estimate_size(num_vectors, leanvec_dims_, allocator);
+
+        // Estimate secondary size
+        using secondary_data_builder = LVQDataBuilder<I2, 0, allocator_type>;
+        const auto secondary_size =
+            secondary_data_builder{}.estimate_size(num_vectors, dimension, allocator);
+
+        // Note: the following sizes are not included in the current estimate as they are
+        // not included in memory breakdown calculations in the current implementation. They
+        // can be added if needed.
+
+        // LeanVec matrices are 2 SimpleData matrices of float, each of size (dimension x
+        // leanvec_dims)
+        const size_t matrices_size = 0; // 2 * dimension * leanvec_dims_ * sizeof(float);
+
+        // LeanVec means is the vector of double of size (dimension)
+        const size_t means_size = 0; // dimension * sizeof(double);
+
+        // is_pca_ flag is a boolean, so it takes 1 byte
+        const size_t is_pca_size = 0; // sizeof(bool);
+
+        const auto total_size =
+            primary_size + secondary_size + matrices_size + means_size + is_pca_size;
+        return total_size;
+    }
+
+    template <typename T, size_t N, typename Alloc>
+    static auto make_dataset(const data::SimpleData<T, N, Alloc>& data) {
+        return svs::c_runtime::decompressed_dataset(data, svs::data::GetDatumAccessor{});
+    }
+
+    template <quantization::lvq::IsLVQDataset Data>
+    static auto make_dataset(const Data& data) {
+        return svs::c_runtime::decompressed_dataset(
+            data, svs::quantization::lvq::DecompressionAccessor(data)
+        );
+    }
+
+    auto get_dataset(const data_type& data) const {
+        return make_dataset(data.view_secondary_dataset());
     }
 };
 
@@ -116,7 +173,8 @@ struct lib::
 };
 
 template <bool UseBlocked, typename F> void for_leanvec_specializations(F&& f) {
-    using byte_alloc = svs::c_runtime::MaybeBlockedAlloc<std::byte, UseBlocked>;
+    using byte_alloc = svs::c_runtime::
+        MaybeBlockedAlloc<std::byte, UseBlocked, AllocatorHandle<std::byte>>;
 
 #define X(P, S, D) f.template operator()<LeanVecDataBuilder<P, S, byte_alloc>, D>();
 #define XX(P, S) X(P, S, DistanceL2) X(P, S, DistanceIP) X(P, S, DistanceCosineSimilarity)

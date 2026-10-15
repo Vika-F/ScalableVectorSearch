@@ -17,23 +17,30 @@
 #include "svs/c/svs_c.h"
 
 #include "algorithm.hpp"
+#include "allocator.hpp"
 #include "error.hpp"
 #include "index.hpp"
 #include "index_builder.hpp"
 #include "leanvec_training_data.hpp"
+#include "logger.hpp"
 #include "storage.hpp"
+#include "stream.hpp"
 #include "threadpool.hpp"
 #include "types_support.hpp"
 
+#include <bit>
 #include <cstddef>
 #include <filesystem>
 #include <memory>
 #include <numeric>
 #include <span>
+#include <string>
 #include <vector>
 
+#include <svs/core/allocator.h>
 #include <svs/core/data.h>
 #include <svs/core/query_result.h>
+#include <svs/lib/memory.h>
 #include <svs/orchestrators/vamana.h>
 
 // C API implementation
@@ -64,6 +71,102 @@ struct svs_leanvec_training_data {
 extern "C" uint32_t svs_get_version() { return SVS_C_API_VERSION; }
 
 extern "C" const char* svs_get_version_string() { return SVS_C_API_VERSION_STRING; }
+
+extern "C" svs_logger_h svs_logger_create(
+    svs_logging_kind_t kind, const char* path, svs_error_h out_err /*=NULL*/
+) {
+    using namespace svs::c_runtime;
+    return wrap_exceptions(
+        [&]() { return new svs_logger{make_sink(kind, path)}; }, out_err
+    );
+}
+
+extern "C" svs_logger_h
+svs_logger_create_custom(svs_logging_i user_logger, svs_error_h out_err /*=NULL*/) {
+    using namespace svs::c_runtime;
+    return wrap_exceptions(
+        [&]() { return new svs_logger{make_custom_sink(user_logger)}; }, out_err
+    );
+}
+
+extern "C" void svs_logger_free(svs_logger_h logger) { delete logger; }
+
+extern "C" bool svs_logger_set_level(
+    svs_logger_h logger, svs_log_level_t level, svs_error_h out_err /*=NULL*/
+) {
+    using namespace svs::c_runtime;
+    return wrap_exceptions(
+        [&]() {
+            INVALID_ARGUMENT_IF(logger == nullptr, "Logger must not be null");
+            svs::logging::set_level(logger->impl, to_logging_level(level));
+            return true;
+        },
+        out_err
+    );
+}
+
+extern "C" bool svs_logger_get_level(
+    svs_logger_h logger, svs_log_level_t* out_level, svs_error_h out_err /*=NULL*/
+) {
+    using namespace svs::c_runtime;
+    return wrap_exceptions(
+        [&]() {
+            INVALID_ARGUMENT_IF(logger == nullptr, "Logger must not be null");
+            EXPECT_ARG_NOT_NULL(out_level);
+            *out_level = static_cast<svs_log_level_t>(logger->impl->level());
+            return true;
+        },
+        out_err
+    );
+}
+
+extern "C" bool svs_logger_set_pattern(
+    svs_logger_h logger, const char* pattern, svs_error_h out_err /*=NULL*/
+) {
+    using namespace svs::c_runtime;
+    return wrap_exceptions(
+        [&]() {
+            INVALID_ARGUMENT_IF(logger == nullptr, "Logger must not be null");
+            EXPECT_ARG_NOT_NULL(pattern);
+            auto new_pattern = std::string(pattern);
+            INVALID_ARGUMENT_IF(new_pattern.empty(), "Pattern should not be empty");
+            logger->impl->set_pattern(new_pattern);
+            logger->pattern = std::move(new_pattern);
+            return true;
+        },
+        out_err
+    );
+}
+
+extern "C" bool svs_logger_get_pattern(
+    svs_logger_h logger, const char** out_pattern, svs_error_h out_err /*=NULL*/
+) {
+    using namespace svs::c_runtime;
+    return wrap_exceptions(
+        [&]() {
+            INVALID_ARGUMENT_IF(logger == nullptr, "Logger must not be null");
+            EXPECT_ARG_NOT_NULL(out_pattern);
+            *out_pattern = logger->pattern.c_str();
+            return true;
+        },
+        out_err
+    );
+}
+
+extern "C" bool svs_set_default_logger(svs_logger_h logger, svs_error_h out_err /*=NULL*/) {
+    using namespace svs::c_runtime;
+    return wrap_exceptions(
+        [&]() {
+            if (logger == nullptr) {
+                svs::logging::reset_to_default();
+            } else {
+                svs::logging::set(logger->impl);
+            }
+            return true;
+        },
+        out_err
+    );
+}
 
 extern "C" svs_algorithm_h svs_algorithm_create_vamana(
     size_t graph_degree,
@@ -503,6 +606,23 @@ extern "C" bool svs_index_builder_set_storage(
     );
 }
 
+extern "C" bool svs_index_builder_set_logger(
+    svs_index_builder_h builder, svs_logger_h logger, svs_error_h out_err /*=NULL*/
+) {
+    using namespace svs::c_runtime;
+    return wrap_exceptions(
+        [&]() {
+            EXPECT_ARG_NOT_NULL(builder);
+            // NULL clears the builder logger: indexes then use the global default logger.
+            // Otherwise share the handle's spdlog logger, so the handle may be freed.
+            builder->impl->set_logger(logger == nullptr ? nullptr : logger->impl);
+            return true;
+        },
+        out_err,
+        false
+    );
+}
+
 extern "C" bool svs_index_builder_set_threadpool(
     svs_index_builder_h builder,
     svs_threadpool_kind_t kind,
@@ -537,6 +657,330 @@ extern "C" bool svs_index_builder_set_threadpool_custom(
             return true;
         },
         out_err
+    );
+}
+
+namespace {
+
+void set_memory_breakdown(
+    svs_memory_breakdown_t* out_breakdown,
+    size_t graph_bytes,
+    size_t data_bytes,
+    size_t metadata_bytes
+) {
+    using namespace svs::c_runtime;
+    INVALID_ARGUMENT_IF(
+        out_breakdown->version > svs_get_version(),
+        "Incompatible svs_memory_breakdown_t version"
+    );
+    INVALID_ARGUMENT_IF(
+        out_breakdown->struct_size > sizeof(svs_memory_breakdown_t),
+        "Incompatible svs_memory_breakdown_t struct_size"
+    );
+
+    if (out_breakdown->struct_size >= offsetof(svs_memory_breakdown_t, graph_bytes) +
+                                          sizeof(out_breakdown->graph_bytes)) {
+        out_breakdown->graph_bytes = graph_bytes;
+    }
+    if (out_breakdown->struct_size >=
+        offsetof(svs_memory_breakdown_t, data_bytes) + sizeof(out_breakdown->data_bytes)) {
+        out_breakdown->data_bytes = data_bytes;
+    }
+    if (out_breakdown->struct_size >= offsetof(svs_memory_breakdown_t, metadata_bytes) +
+                                          sizeof(out_breakdown->metadata_bytes)) {
+        out_breakdown->metadata_bytes = metadata_bytes;
+    }
+}
+
+struct DynamicIndexParams {
+    svs::data::BlockingParameters block_params;
+    svs_sync_kind_t sync_kind = SVS_SYNC_KIND_NONE;
+};
+
+DynamicIndexParams read_dynamic_index_params(const svs_dynamic_index_params_t* params) {
+    using namespace svs::c_runtime;
+    if (params == nullptr) {
+        return {};
+    }
+    INVALID_ARGUMENT_IF(
+        params->version > svs_get_version(),
+        "Incompatible svs_dynamic_index_params_t version"
+    );
+    INVALID_ARGUMENT_IF(
+        params->struct_size > sizeof(svs_dynamic_index_params_t),
+        "Incompatible svs_dynamic_index_params_t struct_size"
+    );
+
+    // Fields not covered by struct_size keep their defaults.
+    size_t blocksize_bytes = 0;
+    size_t blocksize_elements = 0;
+    uint32_t sync_kind = SVS_SYNC_KIND_NONE;
+    if (params->struct_size >= offsetof(svs_dynamic_index_params_t, blocksize_bytes) +
+                                   sizeof(params->blocksize_bytes)) {
+        blocksize_bytes = params->blocksize_bytes;
+    }
+    if (params->struct_size >= offsetof(svs_dynamic_index_params_t, blocksize_elements) +
+                                   sizeof(params->blocksize_elements)) {
+        blocksize_elements = params->blocksize_elements;
+    }
+    if (params->struct_size >=
+        offsetof(svs_dynamic_index_params_t, sync_kind) + sizeof(params->sync_kind)) {
+        sync_kind = params->sync_kind;
+    }
+
+    INVALID_ARGUMENT_IF(
+        blocksize_bytes != 0 && !std::has_single_bit(blocksize_bytes),
+        "blocksize_bytes should be 0 or a power of two"
+    );
+    INVALID_ARGUMENT_IF(
+        blocksize_elements != 0 && !std::has_single_bit(blocksize_elements),
+        "blocksize_elements should be 0 or a power of two"
+    );
+    EXPECT_ARG_IN_RANGE(sync_kind, SVS_SYNC_KIND_NONE, SVS_SYNC_KIND_FINE_GRAIN);
+
+    return {
+        make_blocking_parameters(blocksize_bytes, blocksize_elements),
+        static_cast<svs_sync_kind_t>(sync_kind)};
+}
+
+} // namespace
+
+extern "C" bool svs_index_builder_estimate_memory(
+    svs_index_builder_h builder,
+    size_t num_vectors,
+    svs_memory_breakdown_t* out_breakdown,
+    svs_error_h out_err
+) {
+    using namespace svs::c_runtime;
+    return wrap_exceptions(
+        [&]() {
+            EXPECT_ARG_NOT_NULL(builder);
+            EXPECT_ARG_NOT_NULL(out_breakdown);
+            EXPECT_ARG_GT_THAN(num_vectors, 0);
+            auto builder_ptr = builder->impl;
+            INVALID_ARGUMENT_IF(builder_ptr == nullptr, "Invalid index builder handle");
+            auto breakdown = builder_ptr->estimate_memory_breakdown(num_vectors);
+            set_memory_breakdown(
+                out_breakdown,
+                breakdown.graph_bytes,
+                breakdown.data_bytes,
+                breakdown.metadata_bytes
+            );
+            return true;
+        },
+        out_err,
+        false
+    );
+}
+
+SVS_API bool svs_index_builder_get_default_blocksize_bytes(
+    svs_index_builder_h builder, size_t* out_blocksize_bytes, svs_error_h out_err
+) {
+    using namespace svs::c_runtime;
+    return wrap_exceptions(
+        [&]() {
+            EXPECT_ARG_NOT_NULL(builder);
+            EXPECT_ARG_NOT_NULL(out_blocksize_bytes);
+            // For now, default blocksize is hardcoded in svs::data::BlockingParameters, so
+            // we can just return that value.
+            *out_blocksize_bytes =
+                svs::data::BlockingParameters::default_blocksize_bytes.value();
+            return true;
+        },
+        out_err,
+        false
+    );
+}
+
+extern "C" bool svs_index_builder_estimate_memory_dynamic(
+    svs_index_builder_h builder,
+    size_t num_vectors,
+    size_t blocksize_bytes,
+    svs_memory_breakdown_t* out_breakdown,
+    svs_error_h out_err
+) {
+    using namespace svs::c_runtime;
+    return wrap_exceptions(
+        [&]() {
+            EXPECT_ARG_NOT_NULL(builder);
+            EXPECT_ARG_NOT_NULL(out_breakdown);
+            EXPECT_ARG_GT_THAN(num_vectors, 0);
+            auto builder_ptr = builder->impl;
+            INVALID_ARGUMENT_IF(builder_ptr == nullptr, "Invalid index builder handle");
+            auto breakdown = builder_ptr->estimate_memory_breakdown_dynamic(
+                num_vectors, make_blocking_parameters(blocksize_bytes)
+            );
+            set_memory_breakdown(
+                out_breakdown,
+                breakdown.graph_bytes,
+                breakdown.data_bytes,
+                breakdown.metadata_bytes
+            );
+            return true;
+        },
+        out_err,
+        false
+    );
+}
+
+extern "C" bool svs_index_builder_estimate_memory_dynamic_ex(
+    svs_index_builder_h builder,
+    size_t num_vectors,
+    const svs_dynamic_index_params_t* params,
+    svs_memory_breakdown_t* out_breakdown,
+    svs_error_h out_err
+) {
+    using namespace svs::c_runtime;
+    return wrap_exceptions(
+        [&]() {
+            EXPECT_ARG_NOT_NULL(builder);
+            EXPECT_ARG_NOT_NULL(out_breakdown);
+            EXPECT_ARG_GT_THAN(num_vectors, 0);
+            auto builder_ptr = builder->impl;
+            INVALID_ARGUMENT_IF(builder_ptr == nullptr, "Invalid index builder handle");
+            auto dynamic_params = read_dynamic_index_params(params);
+            auto breakdown = builder_ptr->estimate_memory_breakdown_dynamic(
+                num_vectors, dynamic_params.block_params
+            );
+            set_memory_breakdown(
+                out_breakdown,
+                breakdown.graph_bytes,
+                breakdown.data_bytes,
+                breakdown.metadata_bytes
+            );
+            return true;
+        },
+        out_err,
+        false
+    );
+}
+
+SVS_API bool svs_index_builder_estimate_search_memory(
+    svs_index_builder_h builder,
+    size_t num_queries,
+    size_t num_neighbors,
+    svs_search_params_h search_params,
+    svs_id_filter_i id_filter,
+    size_t* out_size,
+    svs_error_h out_err
+) {
+    using namespace svs::c_runtime;
+    return wrap_exceptions(
+        [&]() {
+            EXPECT_ARG_NOT_NULL(builder);
+            EXPECT_ARG_NOT_NULL(out_size);
+            EXPECT_ARG_GT_THAN(num_queries, 0);
+            EXPECT_ARG_GT_THAN(num_neighbors, 0);
+            const IDFilterAdapter filter(id_filter);
+            auto size = builder->impl->estimate_search_memory(
+                num_queries,
+                num_neighbors,
+                search_params ? search_params->impl : nullptr,
+                id_filter == nullptr ? nullptr : &filter
+            );
+            *out_size = size;
+            return true;
+        },
+        out_err,
+        false
+    );
+}
+
+SVS_API bool svs_index_builder_estimate_search_memory_dynamic(
+    svs_index_builder_h builder,
+    size_t num_queries,
+    size_t num_neighbors,
+    svs_search_params_h search_params,
+    svs_id_filter_i id_filter,
+    size_t blocksize_bytes,
+    size_t* out_size,
+    svs_error_h out_err
+) {
+    using namespace svs::c_runtime;
+    return wrap_exceptions(
+        [&]() {
+            EXPECT_ARG_NOT_NULL(builder);
+            EXPECT_ARG_NOT_NULL(out_size);
+            EXPECT_ARG_GT_THAN(num_queries, 0);
+            EXPECT_ARG_GT_THAN(num_neighbors, 0);
+            const IDFilterAdapter filter(id_filter);
+            auto size = builder->impl->estimate_search_memory_dynamic(
+                num_queries,
+                num_neighbors,
+                search_params ? search_params->impl : nullptr,
+                id_filter == nullptr ? nullptr : &filter,
+                make_blocking_parameters(blocksize_bytes)
+            );
+            *out_size = size;
+            return true;
+        },
+        out_err,
+        false
+    );
+}
+
+SVS_API bool svs_index_builder_estimate_search_memory_dynamic_ex(
+    svs_index_builder_h builder,
+    size_t num_queries,
+    size_t num_neighbors,
+    svs_search_params_h search_params,
+    svs_id_filter_i id_filter,
+    const svs_dynamic_index_params_t* params,
+    size_t* out_size,
+    svs_error_h out_err
+) {
+    using namespace svs::c_runtime;
+    return wrap_exceptions(
+        [&]() {
+            EXPECT_ARG_NOT_NULL(builder);
+            EXPECT_ARG_NOT_NULL(out_size);
+            EXPECT_ARG_GT_THAN(num_queries, 0);
+            EXPECT_ARG_GT_THAN(num_neighbors, 0);
+            auto dynamic_params = read_dynamic_index_params(params);
+            const IDFilterAdapter filter(id_filter);
+            auto size = builder->impl->estimate_search_memory_dynamic(
+                num_queries,
+                num_neighbors,
+                search_params ? search_params->impl : nullptr,
+                id_filter == nullptr ? nullptr : &filter,
+                dynamic_params.block_params
+            );
+            *out_size = size;
+            return true;
+        },
+        out_err,
+        false
+    );
+}
+
+extern "C" bool svs_index_builder_set_allocator(
+    svs_index_builder_h builder, svs_allocator_kind_t kind, svs_error_h out_err
+) {
+    using namespace svs::c_runtime;
+    return wrap_exceptions(
+        [&]() {
+            EXPECT_ARG_NOT_NULL(builder);
+            builder->impl->set_allocator_builder(AllocatorBuilder{kind});
+            return true;
+        },
+        out_err,
+        false
+    );
+}
+
+extern "C" bool svs_index_builder_set_allocator_custom(
+    svs_index_builder_h builder, svs_allocator_i allocator, svs_error_h out_err
+) {
+    using namespace svs::c_runtime;
+    return wrap_exceptions(
+        [&]() {
+            EXPECT_ARG_NOT_NULL(builder);
+            EXPECT_ARG_NOT_NULL(allocator);
+            builder->impl->set_allocator_builder(AllocatorBuilder{allocator});
+            return true;
+        },
+        out_err,
+        false
     );
 }
 
@@ -603,7 +1047,58 @@ extern "C" svs_index_h svs_index_build_dynamic(
             }
 
             auto index = builder->impl->build_dynamic(
-                src_data, std::span(ids, num_vectors), blocksize_bytes
+                src_data,
+                std::span(ids, num_vectors),
+                make_blocking_parameters(blocksize_bytes)
+            );
+            if (index == nullptr) {
+                SET_ERROR(out_err, SVS_ERROR_RUNTIME, "Dynamic index build failed");
+                return svs_index_h{nullptr};
+            }
+
+            auto result = new svs_index;
+            result->impl = index;
+            return result;
+        },
+        out_err
+    );
+}
+
+extern "C" svs_index_h svs_index_build_dynamic_ex(
+    svs_index_builder_h builder,
+    const float* data,
+    const size_t* ids,
+    size_t num_vectors,
+    const svs_dynamic_index_params_t* params,
+    svs_error_h out_err
+) {
+    using namespace svs::c_runtime;
+    return wrap_exceptions(
+        [&]() {
+            EXPECT_ARG_NOT_NULL(builder);
+            EXPECT_ARG_GT_THAN(num_vectors, 0);
+            EXPECT_ARG_NOT_NULL(data);
+            NOT_IMPLEMENTED_IF(
+                (builder->impl->algorithm->type != SVS_ALGORITHM_TYPE_VAMANA),
+                "Only Vamana algorithm is currently supported for dynamic index building"
+            );
+            auto dynamic_params = read_dynamic_index_params(params);
+            auto src_data = svs::data::ConstSimpleDataView<float>(
+                data, num_vectors, builder->impl->dimension
+            );
+
+            std::vector<size_t> generated_ids;
+            if (ids == nullptr) {
+                generated_ids.resize(num_vectors);
+                std::iota(generated_ids.begin(), generated_ids.end(), 0);
+                ids = generated_ids.data();
+            }
+
+            auto index = builder->impl->build_dynamic(
+                src_data,
+                std::span(ids, num_vectors),
+                dynamic_params.block_params,
+                dynamic_params.sync_kind
             );
             if (index == nullptr) {
                 SET_ERROR(out_err, SVS_ERROR_RUNTIME, "Dynamic index build failed");
@@ -634,7 +1129,40 @@ extern "C" svs_index_h svs_index_load_dynamic(
                 "Only Vamana algorithm is currently supported for dynamic index loading"
             );
             auto index = builder->impl->load_dynamic(
-                std::filesystem::path{directory}, blocksize_bytes
+                std::filesystem::path{directory}, make_blocking_parameters(blocksize_bytes)
+            );
+            if (index == nullptr) {
+                SET_ERROR(out_err, SVS_ERROR_RUNTIME, "Dynamic index load failed");
+                return svs_index_h{nullptr};
+            }
+            auto result = new svs_index;
+            result->impl = index;
+            return result;
+        },
+        out_err
+    );
+}
+
+extern "C" svs_index_h svs_index_load_dynamic_ex(
+    svs_index_builder_h builder,
+    const char* directory,
+    const svs_dynamic_index_params_t* params,
+    svs_error_h out_err
+) {
+    using namespace svs::c_runtime;
+    return wrap_exceptions(
+        [&]() {
+            EXPECT_ARG_NOT_NULL(builder);
+            EXPECT_ARG_NOT_NULL(directory);
+            NOT_IMPLEMENTED_IF(
+                (builder->impl->algorithm->type != SVS_ALGORITHM_TYPE_VAMANA),
+                "Only Vamana algorithm is currently supported for dynamic index loading"
+            );
+            auto dynamic_params = read_dynamic_index_params(params);
+            auto index = builder->impl->load_dynamic(
+                std::filesystem::path{directory},
+                dynamic_params.block_params,
+                dynamic_params.sync_kind
             );
             if (index == nullptr) {
                 SET_ERROR(out_err, SVS_ERROR_RUNTIME, "Dynamic index load failed");
@@ -672,7 +1200,175 @@ svs_index_load(svs_index_builder_h builder, const char* directory, svs_error_h o
     );
 }
 
+extern "C" svs_index_h svs_index_load_stream(
+    svs_index_builder_h builder, svs_stream_i stream, svs_error_h out_err
+) {
+    using namespace svs::c_runtime;
+    return wrap_exceptions(
+        [&]() {
+            EXPECT_ARG_NOT_NULL(builder);
+            EXPECT_ARG_NOT_NULL(stream);
+            NOT_IMPLEMENTED_IF(
+                (builder->impl->algorithm->type != SVS_ALGORITHM_TYPE_VAMANA),
+                "Only Vamana algorithm is currently supported for index loading"
+            );
+            StreamBuf::validate(stream, /*need_write=*/false);
+            auto index = builder->impl->load_stream(
+                std::make_unique<InputStream>(*stream->ops, stream->self)
+            );
+            if (index == nullptr) {
+                SET_ERROR(out_err, SVS_ERROR_RUNTIME, "Index load failed");
+                return svs_index_h{nullptr};
+            }
+            auto result = new svs_index;
+            result->impl = index;
+            return result;
+        },
+        out_err
+    );
+}
+
+extern "C" svs_index_h svs_index_load_stream_dynamic(
+    svs_index_builder_h builder,
+    svs_stream_i stream,
+    size_t blocksize_bytes,
+    svs_error_h out_err
+) {
+    using namespace svs::c_runtime;
+    return wrap_exceptions(
+        [&]() {
+            EXPECT_ARG_NOT_NULL(builder);
+            EXPECT_ARG_NOT_NULL(stream);
+            NOT_IMPLEMENTED_IF(
+                (builder->impl->algorithm->type != SVS_ALGORITHM_TYPE_VAMANA),
+                "Only Vamana algorithm is currently supported for dynamic index loading"
+            );
+            StreamBuf::validate(stream, /*need_write=*/false);
+            auto index = builder->impl->load_stream_dynamic(
+                std::make_unique<InputStream>(*stream->ops, stream->self),
+                make_blocking_parameters(blocksize_bytes)
+            );
+            if (index == nullptr) {
+                SET_ERROR(out_err, SVS_ERROR_RUNTIME, "Dynamic index load failed");
+                return svs_index_h{nullptr};
+            }
+            auto result = new svs_index;
+            result->impl = index;
+            return result;
+        },
+        out_err
+    );
+}
+
+extern "C" svs_index_h
+svs_index_convert(svs_index_builder_h builder, svs_index_h src_index, svs_error_h out_err) {
+    using namespace svs::c_runtime;
+    return wrap_exceptions(
+        [&]() {
+            EXPECT_ARG_NOT_NULL(builder);
+            EXPECT_ARG_NOT_NULL(src_index);
+            NOT_IMPLEMENTED_IF(
+                (builder->impl->algorithm->type != SVS_ALGORITHM_TYPE_VAMANA),
+                "Only Vamana algorithm is currently supported for index conversion"
+            );
+            auto index = builder->impl->copy(src_index->impl);
+            if (index == nullptr) {
+                SET_ERROR(out_err, SVS_ERROR_RUNTIME, "Index conversion failed");
+                return svs_index_h{nullptr};
+            }
+            auto result = new svs_index;
+            result->impl = index;
+            return result;
+        },
+        out_err
+    );
+}
+
+extern "C" svs_index_h svs_index_convert_dynamic(
+    svs_index_builder_h builder,
+    svs_index_h src_index,
+    size_t blocksize_bytes /*=0*/,
+    svs_error_h out_err /*=NULL*/
+) {
+    using namespace svs::c_runtime;
+    return wrap_exceptions(
+        [&]() {
+            EXPECT_ARG_NOT_NULL(builder);
+            EXPECT_ARG_NOT_NULL(src_index);
+            NOT_IMPLEMENTED_IF(
+                (builder->impl->algorithm->type != SVS_ALGORITHM_TYPE_VAMANA),
+                "Only Vamana algorithm is currently supported for dynamic index conversion"
+            );
+            INVALID_ARGUMENT_IF(
+                std::dynamic_pointer_cast<DynamicIndex>(src_index->impl) == nullptr,
+                "Source index is not a dynamic index"
+            );
+            auto index = builder->impl->copy_dynamic(
+                src_index->impl, make_blocking_parameters(blocksize_bytes)
+            );
+            if (index == nullptr) {
+                SET_ERROR(out_err, SVS_ERROR_RUNTIME, "Dynamic index conversion failed");
+                return svs_index_h{nullptr};
+            }
+            auto result = new svs_index;
+            result->impl = index;
+            return result;
+        },
+        out_err
+    );
+}
+
+extern "C" svs_index_h svs_index_convert_dynamic_ex(
+    svs_index_builder_h builder,
+    svs_index_h src_index,
+    const svs_dynamic_index_params_t* params,
+    svs_error_h out_err /*=NULL*/
+) {
+    using namespace svs::c_runtime;
+    return wrap_exceptions(
+        [&]() {
+            EXPECT_ARG_NOT_NULL(builder);
+            EXPECT_ARG_NOT_NULL(src_index);
+            NOT_IMPLEMENTED_IF(
+                (builder->impl->algorithm->type != SVS_ALGORITHM_TYPE_VAMANA),
+                "Only Vamana algorithm is currently supported for dynamic index conversion"
+            );
+            INVALID_ARGUMENT_IF(
+                std::dynamic_pointer_cast<DynamicIndex>(src_index->impl) == nullptr,
+                "Source index is not a dynamic index"
+            );
+            auto dynamic_params = read_dynamic_index_params(params);
+            auto index = builder->impl->copy_dynamic(
+                src_index->impl, dynamic_params.block_params, dynamic_params.sync_kind
+            );
+            if (index == nullptr) {
+                SET_ERROR(out_err, SVS_ERROR_RUNTIME, "Dynamic index conversion failed");
+                return svs_index_h{nullptr};
+            }
+            auto result = new svs_index;
+            result->impl = index;
+            return result;
+        },
+        out_err
+    );
+}
+
 extern "C" void svs_index_free(svs_index_h index) { delete index; }
+
+extern "C" bool svs_index_get_size(
+    svs_index_h index, size_t* out_size, svs_error_h out_err /*=NULL*/
+) {
+    using namespace svs::c_runtime;
+    return wrap_exceptions(
+        [&]() {
+            EXPECT_ARG_NOT_NULL(index);
+            EXPECT_ARG_NOT_NULL(out_size);
+            *out_size = index->impl->size();
+            return true;
+        },
+        out_err
+    );
+}
 
 namespace {
 
@@ -828,6 +1524,25 @@ svs_index_save(svs_index_h index, const char* directory, svs_error_h out_err) {
     );
 }
 
+extern "C" bool
+svs_index_save_stream(svs_index_h index, svs_stream_i stream, svs_error_h out_err) {
+    using namespace svs::c_runtime;
+    return wrap_exceptions(
+        [&]() {
+            EXPECT_ARG_NOT_NULL(index);
+            EXPECT_ARG_NOT_NULL(stream);
+            StreamBuf::validate(stream, /*need_write=*/true);
+            OutputStream os(*stream->ops, stream->self);
+            index->impl->save(os);
+            // The core never flushes and ~StreamBuf drops unflushed bytes, so without this
+            // the final partial buffer would be lost while the save reports success.
+            os.flush();
+            return true;
+        },
+        out_err
+    );
+}
+
 extern "C" bool svs_index_dynamic_add_points(
     svs_index_h index,
     const float* new_points,
@@ -901,6 +1616,26 @@ extern "C" bool svs_index_dynamic_has_id(
                 dynamic_index_ptr == nullptr, "Index does not support dynamic updates"
             );
             *out_has_id = dynamic_index_ptr->has_id(id);
+            return true;
+        },
+        out_err,
+        false
+    );
+}
+
+extern "C" bool svs_index_dynamic_get_sync_kind(
+    svs_index_h index, svs_sync_kind_t* out_sync_kind, svs_error_h out_err
+) {
+    using namespace svs::c_runtime;
+    return wrap_exceptions(
+        [&]() {
+            EXPECT_ARG_NOT_NULL(index);
+            EXPECT_ARG_NOT_NULL(out_sync_kind);
+            auto dynamic_index_ptr = std::dynamic_pointer_cast<DynamicIndex>(index->impl);
+            INVALID_ARGUMENT_IF(
+                dynamic_index_ptr == nullptr, "Index does not support dynamic updates"
+            );
+            *out_sync_kind = dynamic_index_ptr->sync_kind;
             return true;
         },
         out_err,
@@ -1059,20 +1794,15 @@ extern "C" bool svs_index_get_memory_breakdown(
         [&]() {
             EXPECT_ARG_NOT_NULL(index);
             EXPECT_ARG_NOT_NULL(out_breakdown);
-            INVALID_ARGUMENT_IF(
-                out_breakdown->version > svs_get_version(),
-                "Incompatible svs_memory_breakdown_t version"
-            );
-            INVALID_ARGUMENT_IF(
-                out_breakdown->struct_size > sizeof(svs_memory_breakdown_t),
-                "Incompatible svs_memory_breakdown_t struct_size"
-            );
             auto& index_ptr = index->impl;
             INVALID_ARGUMENT_IF(index_ptr == nullptr, "Invalid index handle");
             auto breakdown = index_ptr->get_memory_breakdown();
-            out_breakdown->graph_bytes = breakdown.graph_bytes;
-            out_breakdown->data_bytes = breakdown.data_bytes;
-            out_breakdown->metadata_bytes = breakdown.metadata_bytes;
+            set_memory_breakdown(
+                out_breakdown,
+                breakdown.graph_bytes,
+                breakdown.data_bytes,
+                breakdown.metadata_bytes
+            );
             return true;
         },
         out_err,

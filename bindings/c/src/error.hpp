@@ -97,6 +97,25 @@ class unsupported_hw : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+class out_of_memory : public std::runtime_error {
+  public:
+    using std::runtime_error::runtime_error;
+};
+
+// Carries the code a callback (e.g. a stream interface) reported, so wrap_exceptions
+// can surface it verbatim instead of collapsing it to SVS_ERROR_RUNTIME.
+class coded_error : public std::runtime_error {
+  public:
+    coded_error(svs_error_code_t code, const std::string& msg)
+        : std::runtime_error(msg)
+        , code_{code} {}
+
+    svs_error_code_t code() const noexcept { return code_; }
+
+  private:
+    svs_error_code_t code_;
+};
+
 // A helper to wrap C++ exceptions and convert them to C error codes/messages.
 template <typename Callable, typename Result = std::invoke_result_t<Callable>>
 Result wrap_exceptions(Callable&& func, svs_error_h err, Result err_res = {}) noexcept {
@@ -115,8 +134,21 @@ Result wrap_exceptions(Callable&& func, svs_error_h err, Result err_res = {}) no
     } catch (const svs::c_runtime::unsupported_hw& ex) {
         SET_ERROR(err, SVS_ERROR_UNSUPPORTED_HW, ex.what());
         return err_res;
+    } catch (const svs::c_runtime::out_of_memory& ex) {
+        SET_ERROR(err, SVS_ERROR_OUT_OF_MEMORY, ex.what());
+        return err_res;
     } catch (const svs::lib::ANNException& ex) {
         SET_ERROR(err, SVS_ERROR_GENERIC, ex.what());
+        return err_res;
+    } catch (const std::bad_alloc& ex) {
+        SET_ERROR(err, SVS_ERROR_OUT_OF_MEMORY, ex.what());
+        return err_res;
+    } catch (const svs::c_runtime::coded_error& ex) {
+        // Must precede std::runtime_error, its base class, or this clause is unreachable.
+        SET_ERROR(err, ex.code(), ex.what());
+        return err_res;
+    } catch (const std::logic_error& ex) {
+        SET_ERROR(err, SVS_ERROR_INVALID_OPERATION, ex.what());
         return err_res;
     } catch (const std::runtime_error& ex) {
         SET_ERROR(err, SVS_ERROR_RUNTIME, ex.what());
